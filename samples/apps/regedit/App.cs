@@ -9,6 +9,7 @@ using ReactorRegedit.Components.Dialogs;
 using ReactorRegedit.Models;
 using ReactorRegedit.Services;
 using Microsoft.UI.Xaml;
+using Microsoft.UI.Xaml.Media;
 using Microsoft.Win32;
 using static Microsoft.UI.Reactor.Factories;
 using static Microsoft.UI.Reactor.Core.Theme;
@@ -56,6 +57,14 @@ class RegeditApp : Component
 
         // Export state
         var (exportAll, setExportAll) = UseState(false);
+        var (exportTarget, setExportTarget) = UseState("");
+        var (favoriteTarget, setFavoriteTarget) = UseState("");
+
+        // Rename / destructive-action bookkeeping. Context menus can target a
+        // key other than the one currently open, so the target is captured
+        // here instead of read from currentKeyPath at confirm time.
+        var (renameKeyPath, setRenameKeyPath) = UseState("");
+        var (pendingDelete, setPendingDelete) = UseState<DeleteRequest?>(null);
 
         // Status bar
         var (statusText, setStatusText) = UseState(Strings.Ready);
@@ -107,30 +116,34 @@ class RegeditApp : Component
             });
         }
 
-        void RefreshCurrentKey()
+        void RefreshKey(string path)
         {
-            if (string.IsNullOrEmpty(currentKeyPath)) return;
+            if (string.IsNullOrEmpty(path)) return;
 
             var syncContext = SynchronizationContext.Current;
             setIsLoading(true);
 
             Task.Run(async () =>
             {
-                var newValues = await RegistryService.GetValuesAsync(currentKeyPath);
+                var newValues = await RegistryService.GetValuesAsync(path);
                 // Also refresh subkeys
-                var subkeys = await RegistryService.GetSubKeysAsync(currentKeyPath);
+                var subkeys = await RegistryService.GetSubKeysAsync(path);
                 syncContext?.Post(_ =>
                 {
-                    setValues(newValues);
+                    if (string.Equals(path, currentKeyPath, StringComparison.OrdinalIgnoreCase))
+                        setValues(newValues);
+
                     var newChildren = new Dictionary<string, RegistryKeyEntry[]>(treeState.Children)
                     {
-                        [currentKeyPath] = subkeys
+                        [path] = subkeys
                     };
                     setTreeState((Expanded: treeState.Expanded, Children: newChildren));
                     setIsLoading(false);
                 }, null);
             });
         }
+
+        void RefreshCurrentKey() => RefreshKey(currentKeyPath);
 
         void AddressBarSubmit(string path)
         {
@@ -139,9 +152,10 @@ class RegeditApp : Component
         }
 
         // ── New key/value handlers ───────────────────────────────────
-        void CreateNewKey()
+        void CreateNewKey(string targetPath)
         {
-            if (string.IsNullOrEmpty(currentKeyPath)) return;
+            var path = string.IsNullOrEmpty(targetPath) ? currentKeyPath : targetPath;
+            if (string.IsNullOrEmpty(path)) return;
             var syncContext = SynchronizationContext.Current;
             Task.Run(async () =>
             {
@@ -149,33 +163,49 @@ class RegeditApp : Component
                 var baseName = "New Key #";
                 var idx = 1;
                 var name = baseName + idx;
-                using var parent = RegistryService.OpenKey(currentKeyPath);
+                using var parent = RegistryService.OpenKey(path);
                 if (parent is not null)
                 {
                     while (parent.OpenSubKey(name) is not null) { idx++; name = baseName + idx; }
                 }
-                var result = await RegistryService.CreateKeyAsync(currentKeyPath, name);
-                syncContext?.Post(_ => RefreshCurrentKey(), null);
+                await RegistryService.CreateKeyAsync(path, name);
+                syncContext?.Post(_ =>
+                {
+                    // Creating a child while the target is collapsed would hide
+                    // the new key; expand the target so the result is visible.
+                    if (!treeState.Expanded.Contains(path))
+                        ExpandTreeNode(path);
+                    RefreshKey(path);
+                    setStatusText($"Created key {name}.");
+                }, null);
             });
         }
 
-        void CreateNewValue(RegistryValueKind kind)
+        void CreateNewValue(RegistryValueKind kind, string targetPath)
         {
-            if (string.IsNullOrEmpty(currentKeyPath)) return;
+            var path = string.IsNullOrEmpty(targetPath) ? currentKeyPath : targetPath;
+            if (string.IsNullOrEmpty(path)) return;
             var syncContext = SynchronizationContext.Current;
             Task.Run(async () =>
             {
                 var baseName = "New Value #";
                 var idx = 1;
                 var name = baseName + idx;
-                using var key = RegistryService.OpenKey(currentKeyPath);
+                using var key = RegistryService.OpenKey(path);
                 if (key is not null)
                 {
                     var existing = key.GetValueNames();
                     while (existing.Contains(name)) { idx++; name = baseName + idx; }
                 }
-                await RegistryService.CreateValueAsync(currentKeyPath, name, kind);
-                syncContext?.Post(_ => RefreshCurrentKey(), null);
+                await RegistryService.CreateValueAsync(path, name, kind);
+                syncContext?.Post(_ =>
+                {
+                    if (!string.Equals(path, currentKeyPath, StringComparison.OrdinalIgnoreCase))
+                        NavigateToKey(path);
+                    else
+                        RefreshKey(path);
+                    setStatusText($"Created value {name}.");
+                }, null);
             });
         }
 
@@ -300,35 +330,72 @@ class RegeditApp : Component
         }
 
         // ── Delete handlers ──────────────────────────────────────────
-        void DeleteSelectedValue(RegistryValueEntry value)
+        /// <summary>
+        /// Requests confirmation for a destructive action. Context menus can
+        /// target a key other than the open one, so the request carries both
+        /// the path and the label to show in the dialog.
+        /// </summary>
+        void RequestDelete(string keyPath, string valueName, string label, bool isKey)
         {
-            if (string.IsNullOrEmpty(currentKeyPath)) return;
-            var syncContext = SynchronizationContext.Current;
-            Task.Run(async () =>
-            {
-                await RegistryService.DeleteValueAsync(currentKeyPath, value.Name);
-                syncContext?.Post(_ => RefreshCurrentKey(), null);
-            });
+            if (string.IsNullOrEmpty(keyPath)) return;
+            setPendingDelete(new DeleteRequest(keyPath, valueName, label, isKey));
         }
 
-        void DeleteCurrentKey()
+        void ConfirmPendingDelete()
         {
-            if (string.IsNullOrEmpty(currentKeyPath)) return;
-            // Don't allow deleting root keys
-            if (!currentKeyPath.Contains('\\')) return;
-
-            var parentPath = currentKeyPath[..currentKeyPath.LastIndexOf('\\')];
+            if (pendingDelete is not { } request) return;
+            setPendingDelete(null);
             var syncContext = SynchronizationContext.Current;
+
+            if (!request.IsKey)
+            {
+                Task.Run(async () =>
+                {
+                    await RegistryService.DeleteValueAsync(request.KeyPath, request.ValueName);
+                    syncContext?.Post(_ =>
+                    {
+                        RefreshKey(request.KeyPath);
+                        setStatusText($"Deleted value {request.Label}.");
+                    }, null);
+                });
+                return;
+            }
+
+            // Root hives cannot be deleted.
+            if (!request.KeyPath.Contains('\\')) return;
+            var parentPath = request.KeyPath[..request.KeyPath.LastIndexOf('\\')];
+
             Task.Run(async () =>
             {
-                var success = await RegistryService.DeleteKeyAsync(currentKeyPath);
+                var success = await RegistryService.DeleteKeyAsync(request.KeyPath);
                 syncContext?.Post(_ =>
                 {
-                    if (success)
+                    if (!success)
+                    {
+                        setStatusText("Could not delete the key.");
+                        return;
+                    }
+
+                    setStatusText($"Deleted key {request.Label}.");
+                    if (string.Equals(request.KeyPath, currentKeyPath, StringComparison.OrdinalIgnoreCase))
                         NavigateToKey(parentPath);
+                    else
+                        RefreshKey(parentPath);
                 }, null);
             });
         }
+
+        void DeleteSelectedValue(RegistryValueEntry value) =>
+            RequestDelete(currentKeyPath, value.Name, value.DisplayName, isKey: false);
+
+        void DeleteKeyPath(string path)
+        {
+            if (string.IsNullOrEmpty(path)) return;
+            var label = path.Contains('\\') ? path[(path.LastIndexOf('\\') + 1)..] : path;
+            RequestDelete(path, "", label, isKey: true);
+        }
+
+        void DeleteCurrentKey() => DeleteKeyPath(currentKeyPath);
 
         // ── Rename handlers ─────────────────────────────────────────
         void StartRenameValue(RegistryValueEntry value)
@@ -357,8 +424,15 @@ class RegeditApp : Component
 
         void StartRenameKey()
         {
-            if (string.IsNullOrEmpty(currentKeyPath) || !currentKeyPath.Contains('\\')) return;
-            var name = currentKeyPath[(currentKeyPath.LastIndexOf('\\') + 1)..];
+            if (string.IsNullOrEmpty(currentKeyPath)) return;
+            StartRenameKeyAtPath(currentKeyPath);
+        }
+
+        void StartRenameKeyAtPath(string path)
+        {
+            if (string.IsNullOrEmpty(path) || !path.Contains('\\')) return;
+            var name = path[(path.LastIndexOf('\\') + 1)..];
+            setRenameKeyPath(path);
             setEditValueName(name);
             setEditValueData(name);
             setActiveDialog(ActiveDialog.RenameKey);
@@ -366,18 +440,23 @@ class RegeditApp : Component
 
         void PerformRenameKey()
         {
-            if (string.IsNullOrEmpty(currentKeyPath)) return;
+            var oldPath = string.IsNullOrEmpty(renameKeyPath) ? currentKeyPath : renameKeyPath;
+            if (string.IsNullOrEmpty(oldPath) || !oldPath.Contains('\\')) return;
             var syncContext = SynchronizationContext.Current;
             var newName = editValueData;
-            var parentPath = currentKeyPath[..currentKeyPath.LastIndexOf('\\')];
+            var parentPath = oldPath[..oldPath.LastIndexOf('\\')];
             Task.Run(async () =>
             {
-                var success = await RegistryService.RenameKeyAsync(currentKeyPath, newName);
+                var success = await RegistryService.RenameKeyAsync(oldPath, newName);
                 syncContext?.Post(_ =>
                 {
                     setActiveDialog(ActiveDialog.None);
-                    if (success)
-                        NavigateToKey($"{parentPath}\\{newName}");
+                    if (!success) return;
+                    var newPath = $"{parentPath}\\{newName}";
+                    if (string.Equals(oldPath, currentKeyPath, StringComparison.OrdinalIgnoreCase))
+                        NavigateToKey(newPath);
+                    else
+                        RefreshKey(parentPath);
                 }, null);
             });
         }
@@ -435,19 +514,40 @@ class RegeditApp : Component
             PerformFind();
         }
 
-        // ── Copy key name ────────────────────────────────────────────
-        void CopyKeyName()
+        // ── Copy handlers ────────────────────────────────────────────
+        static void CopyToClipboard(string text)
         {
-            if (string.IsNullOrEmpty(currentKeyPath)) return;
             var dataPackage = new global::Windows.ApplicationModel.DataTransfer.DataPackage();
-            dataPackage.SetText(currentKeyPath);
+            dataPackage.SetText(text);
             global::Windows.ApplicationModel.DataTransfer.Clipboard.SetContent(dataPackage);
+        }
+
+        void CopyKeyName(string path)
+        {
+            var target = string.IsNullOrEmpty(path) ? currentKeyPath : path;
+            if (string.IsNullOrEmpty(target)) return;
+            CopyToClipboard(target);
+            setStatusText("Copied key name.");
+        }
+
+        void CopyValueName(RegistryValueEntry value)
+        {
+            CopyToClipboard(value.DisplayName);
+            setStatusText("Copied value name.");
+        }
+
+        void CopyValueData(RegistryValueEntry value)
+        {
+            CopyToClipboard(value.DisplayData);
+            setStatusText("Copied value data.");
         }
 
         // ── Export handler ───────────────────────────────────────────
         void PerformExport()
         {
-            var exportPath = exportAll ? "HKEY_LOCAL_MACHINE" : currentKeyPath;
+            var exportPath = exportAll
+                ? "HKEY_LOCAL_MACHINE"
+                : (string.IsNullOrEmpty(exportTarget) ? currentKeyPath : exportTarget);
             if (string.IsNullOrEmpty(exportPath)) return;
 
             var syncContext = SynchronizationContext.Current;
@@ -459,23 +559,44 @@ class RegeditApp : Component
                 var content = await RegFileService.ExportAsync(exportPath);
                 syncContext?.Post(_ =>
                 {
-                    var dataPackage = new global::Windows.ApplicationModel.DataTransfer.DataPackage();
-                    dataPackage.SetText(content);
-                    global::Windows.ApplicationModel.DataTransfer.Clipboard.SetContent(dataPackage);
+                    CopyToClipboard(content);
                     setStatusText("Exported to clipboard.");
                 }, null);
             });
         }
 
+        void StartExport(string path)
+        {
+            setExportTarget(string.IsNullOrEmpty(path) ? currentKeyPath : path);
+            setExportAll(false);
+            setActiveDialog(ActiveDialog.Export);
+        }
+
         // ── Favorites handlers ───────────────────────────────────────
+        void StartAddFavorite(string path)
+        {
+            var target = string.IsNullOrEmpty(path) ? currentKeyPath : path;
+            if (string.IsNullOrEmpty(target)) return;
+
+            // Default favorite name to the last segment of the key path.
+            var name = target.Contains('\\')
+                ? target[(target.LastIndexOf('\\') + 1)..]
+                : target;
+            setFavoriteTarget(target);
+            setFavoriteName(name);
+            setActiveDialog(ActiveDialog.AddFavorite);
+        }
+
         void AddFavorite()
         {
-            if (string.IsNullOrEmpty(currentKeyPath)) return;
+            var path = string.IsNullOrEmpty(favoriteTarget) ? currentKeyPath : favoriteTarget;
+            if (string.IsNullOrEmpty(path)) return;
             var newFavs = new Dictionary<string, string>(favorites)
             {
-                [favoriteName] = currentKeyPath
+                [favoriteName] = path
             };
             setFavorites(newFavs);
+            setFavoriteTarget("");
             setActiveDialog(ActiveDialog.None);
         }
 
@@ -487,6 +608,64 @@ class RegeditApp : Component
             newFavs.Remove(keys[selectedFavoriteIndex]);
             setFavorites(newFavs);
             setActiveDialog(ActiveDialog.None);
+        }
+
+        // ── Key context-menu dispatcher ──────────────────────────────
+        /// <summary>
+        /// The tree's context menu reports the node it was opened on plus a
+        /// semantic action; routing happens here so the tree stays presentation
+        /// only and every command reuses the menu-bar handlers.
+        /// </summary>
+        void HandleKeyAction(string path, KeyAction action)
+        {
+            switch (action)
+            {
+                case KeyAction.Open:
+                    NavigateToKey(path);
+                    break;
+                case KeyAction.NewKey:
+                    CreateNewKey(path);
+                    break;
+                case KeyAction.NewStringValue:
+                    CreateNewValue(RegistryValueKind.String, path);
+                    break;
+                case KeyAction.NewBinaryValue:
+                    CreateNewValue(RegistryValueKind.Binary, path);
+                    break;
+                case KeyAction.NewDwordValue:
+                    CreateNewValue(RegistryValueKind.DWord, path);
+                    break;
+                case KeyAction.NewQwordValue:
+                    CreateNewValue(RegistryValueKind.QWord, path);
+                    break;
+                case KeyAction.NewMultiStringValue:
+                    CreateNewValue(RegistryValueKind.MultiString, path);
+                    break;
+                case KeyAction.NewExpandStringValue:
+                    CreateNewValue(RegistryValueKind.ExpandString, path);
+                    break;
+                case KeyAction.Rename:
+                    StartRenameKeyAtPath(path);
+                    break;
+                case KeyAction.Delete:
+                    DeleteKeyPath(path);
+                    break;
+                case KeyAction.CopyKeyName:
+                    CopyKeyName(path);
+                    break;
+                case KeyAction.Export:
+                    StartExport(path);
+                    break;
+                case KeyAction.Refresh:
+                    RefreshKey(path);
+                    break;
+                case KeyAction.Find:
+                    setActiveDialog(ActiveDialog.Find);
+                    break;
+                case KeyAction.AddFavorite:
+                    StartAddFavorite(path);
+                    break;
+            }
         }
 
         // ── Permissions (P/Invoke native security dialog) ────────────
@@ -554,7 +733,7 @@ class RegeditApp : Component
                         catch { }
                     });
                 }),
-                MenuItem(Strings.Export, () => setActiveDialog(ActiveDialog.Export)) with
+                MenuItem(Strings.Export, () => StartExport(currentKeyPath)) with
                     { KeyboardAccelerators = [Accelerator(global::Windows.System.VirtualKey.E, global::Windows.System.VirtualKeyModifiers.Control)] },
                 MenuSeparator(),
                 MenuItem(Strings.LoadHive, () => { /* requires elevation */ }),
@@ -572,14 +751,14 @@ class RegeditApp : Component
             // Edit
             Menu(Strings.EditMenu, [
                 MenuSubItem(Strings.NewMenu, [
-                    MenuItem(Strings.NewKey, CreateNewKey),
+                    MenuItem(Strings.NewKey, () => CreateNewKey(currentKeyPath)),
                     MenuSeparator(),
-                    MenuItem(Strings.NewStringValue, () => CreateNewValue(RegistryValueKind.String)),
-                    MenuItem(Strings.NewBinaryValue, () => CreateNewValue(RegistryValueKind.Binary)),
-                    MenuItem(Strings.NewDwordValue, () => CreateNewValue(RegistryValueKind.DWord)),
-                    MenuItem(Strings.NewQwordValue, () => CreateNewValue(RegistryValueKind.QWord)),
-                    MenuItem(Strings.NewMultiStringValue, () => CreateNewValue(RegistryValueKind.MultiString)),
-                    MenuItem(Strings.NewExpandableStringValue, () => CreateNewValue(RegistryValueKind.ExpandString)),
+                    MenuItem(Strings.NewStringValue, () => CreateNewValue(RegistryValueKind.String, currentKeyPath)),
+                    MenuItem(Strings.NewBinaryValue, () => CreateNewValue(RegistryValueKind.Binary, currentKeyPath)),
+                    MenuItem(Strings.NewDwordValue, () => CreateNewValue(RegistryValueKind.DWord, currentKeyPath)),
+                    MenuItem(Strings.NewQwordValue, () => CreateNewValue(RegistryValueKind.QWord, currentKeyPath)),
+                    MenuItem(Strings.NewMultiStringValue, () => CreateNewValue(RegistryValueKind.MultiString, currentKeyPath)),
+                    MenuItem(Strings.NewExpandableStringValue, () => CreateNewValue(RegistryValueKind.ExpandString, currentKeyPath)),
                 ]),
                 MenuSeparator(),
                 MenuItem(Strings.Permissions, ShowPermissions),
@@ -589,7 +768,7 @@ class RegeditApp : Component
                 MenuItem(Strings.Rename, StartRenameKey) with
                     { KeyboardAccelerators = [Accelerator(global::Windows.System.VirtualKey.F2)] },
                 MenuSeparator(),
-                MenuItem(Strings.CopyKeyName, CopyKeyName),
+                MenuItem(Strings.CopyKeyName, () => CopyKeyName(currentKeyPath)),
                 MenuSeparator(),
                 MenuItem(Strings.Find, () => setActiveDialog(ActiveDialog.Find)) with
                     { KeyboardAccelerators = [Accelerator(global::Windows.System.VirtualKey.F, global::Windows.System.VirtualKeyModifiers.Control)] },
@@ -609,8 +788,8 @@ class RegeditApp : Component
             ]),
 
             // Favorites
-            Menu(Strings.FavoritesMenu, BuildFavoritesMenu(favorites, favoriteName, currentKeyPath,
-                setFavoriteName, setActiveDialog, setSelectedFavoriteIndex, NavigateToKey)),
+            Menu(Strings.FavoritesMenu, BuildFavoritesMenu(favorites, currentKeyPath,
+                StartAddFavorite, setActiveDialog, setSelectedFavoriteIndex, NavigateToKey)),
 
             // Help
             Menu(Strings.HelpMenu, [
@@ -620,14 +799,27 @@ class RegeditApp : Component
 
         // ── Address bar ──────────────────────────────────────────────
         var addressBar = When(showAddressBar, () =>
-            HStack(8,
-                TextBlock(Strings.Computer)
-                    .VAlign(VerticalAlignment.Center)
-                    .SemiBold(),
-                AutoSuggestBox(addressBarText, setAddressBarText, text => AddressBarSubmit(text))
-                    .PlaceholderText("HKEY_LOCAL_MACHINE\\SOFTWARE")
-                    .HAlign(HorizontalAlignment.Stretch)
-            ).Margin(4, 2, 4, 2)
+            Border(
+                HStack(10,
+                    TextBlock("\uE8B7")
+                        .FontFamily(Palette.IconFont)
+                        .FontSize(14)
+                        .Foreground(Palette.Blue)
+                        .VAlign(VerticalAlignment.Center),
+                    TextBlock(Strings.Computer)
+                        .FontSize(10)
+                        .SemiBold()
+                        .Foreground(Palette.TextMuted)
+                        .VAlign(VerticalAlignment.Center)
+                        .Set(tb => tb.CharacterSpacing = 60),
+                    AutoSuggestBox(addressBarText, setAddressBarText, text => AddressBarSubmit(text))
+                        .PlaceholderText("HKEY_LOCAL_MACHINE\\SOFTWARE")
+                        .HAlign(HorizontalAlignment.Stretch)
+                ).Padding(12, 6, 12, 6)
+            )
+            .Background(Palette.BackgroundAlt)
+
+        .WithBorder(Palette.BorderSoft)
         );
 
         // ── Tree pane ────────────────────────────────────────────────
@@ -637,30 +829,61 @@ class RegeditApp : Component
             CurrentKeyPath: currentKeyPath,
             OnNavigate: NavigateToKey,
             OnExpand: ExpandTreeNode,
-            OnContextMenu: _ => { }
+            OnKeyAction: HandleKeyAction
         ));
 
         // ── Value list pane ──────────────────────────────────────────
         var valueList = Component<ValueList, ValueListProps>(new ValueListProps(
+            KeyPath: currentKeyPath,
             Values: values,
             SelectedIndex: selectedValueIndex,
             OnSelectionChanged: setSelectedValueIndex,
             OnModify: OpenEditDialog,
             OnModifyBinary: OpenBinaryEditDialog,
             OnDelete: DeleteSelectedValue,
-            OnRename: StartRenameValue
+            OnRename: StartRenameValue,
+            OnCopyName: CopyValueName,
+            OnCopyData: CopyValueData,
+            OnNewKey: () => CreateNewKey(currentKeyPath),
+            OnNewValue: kind => CreateNewValue(kind, currentKeyPath),
+            OnRefresh: RefreshCurrentKey,
+            OnExport: () => StartExport(currentKeyPath),
+            OnCopyKeyPath: () => CopyKeyName(currentKeyPath),
+            OnFind: () => setActiveDialog(ActiveDialog.Find)
         ));
 
         // ── Status bar ───────────────────────────────────────────────
         var statusBar = When(showStatusBar, () =>
-            HStack(8,
+            Grid(
+                [GridSize.Auto, GridSize.Star(), GridSize.Auto],
+                [GridSize.Px(28)],
+                HStack(8,
+                    DotEl(isLoading ? Palette.Amber : Palette.Mint),
+                    TextBlock(statusText)
+                        .FontSize(11)
+                        .Foreground(Palette.TextSecondary)
+                        .TextTrimming(Microsoft.UI.Xaml.TextTrimming.CharacterEllipsis)
+                        .TextWrapping(Microsoft.UI.Xaml.TextWrapping.NoWrap)
+                        .VAlign(VerticalAlignment.Center)
+                ).Padding(12, 0, 8, 0).Grid(row: 0, column: 0),
                 TextBlock(string.IsNullOrEmpty(currentKeyPath) ? Strings.Computer : currentKeyPath)
+                    .FontFamily(Palette.MonoFont)
+                    .FontSize(10.5)
+                    .Foreground(Palette.TextMuted)
                     .TextTrimming(Microsoft.UI.Xaml.TextTrimming.CharacterEllipsis)
-                    .TextWrapping(Microsoft.UI.Xaml.TextWrapping.NoWrap),
-                When(isLoading, () => ProgressRing().Width(16).Height(16).IsActive(true))
+                    .TextWrapping(Microsoft.UI.Xaml.TextWrapping.NoWrap)
+                    .HAlign(HorizontalAlignment.Right)
+                    .VAlign(VerticalAlignment.Center)
+                    .Margin(8, 0, 12, 0)
+                    .Grid(row: 0, column: 1),
+                When(isLoading,
+                        () => ProgressRing().Width(14).Height(14).IsActive(true))
+                    .Margin(0, 0, 12, 0)
+                    .Grid(row: 0, column: 2)
             )
-            .Padding(8, 4, 8, 4)
-            .WithBorder(DividerStroke)
+            .Background(Palette.BackgroundAlt)
+
+        .WithBorder(Palette.BorderSoft)
         );
 
         // ── Dialogs ─────────────────────────────────────────────────
@@ -744,7 +967,7 @@ class RegeditApp : Component
         var exportDialog = Component<ExportDialog, ExportDialogProps>(new ExportDialogProps(
             IsOpen: activeDialog == ActiveDialog.Export,
             ExportAll: exportAll,
-            SelectedBranch: currentKeyPath,
+            SelectedBranch: string.IsNullOrEmpty(exportTarget) ? currentKeyPath : exportTarget,
             OnExportAllChanged: setExportAll,
             OnExport: PerformExport,
             OnCancel: () => setActiveDialog(ActiveDialog.None)
@@ -802,12 +1025,60 @@ class RegeditApp : Component
             OnClosed = _ => setActiveDialog(ActiveDialog.None),
         };
 
+        // ── Destructive-action confirmation ─────────────────────────
+        // Context menus make deletion a single misclick away, so every
+        // destructive command is routed through this dialog.
+        var confirmDeleteDialog = (ContentDialog(
+            Strings.ConfirmTitle,
+            VStack(10,
+                TextBlock(pendingDelete?.IsKey == true
+                        ? Strings.ConfirmDeleteKey
+                        : Strings.ConfirmDeleteValue)
+                    .TextWrapping(TextWrapping.Wrap)
+                    .Foreground(Palette.TextSecondary),
+                TextBlock(pendingDelete is null
+                        ? ""
+                        : (pendingDelete.IsKey ? "KEY" : "VALUE") + "\n" + pendingDelete.Label)
+                    .FontFamily(Palette.MonoFont)
+                    .FontSize(12)
+                    .Foreground(pendingDelete?.IsKey == true ? Palette.Amber : Palette.Mint)
+            ).Width(420),
+            Strings.Delete
+        ) with
+        {
+            IsOpen = pendingDelete is not null,
+            CloseButtonText = Strings.Cancel,
+            DefaultButton = Microsoft.UI.Xaml.Controls.ContentDialogButton.Close,
+            OnClosed = result =>
+            {
+                if (result == Microsoft.UI.Xaml.Controls.ContentDialogResult.Primary)
+                    ConfirmPendingDelete();
+                else
+                    setPendingDelete(null);
+            },
+        }).Set(d => d.RequestedTheme = ElementTheme.Dark);
+
         // ── Layout ───────────────────────────────────────────────────
+        var menuBarElement = menuBar.Set(mb =>
+        {
+            mb.Background = BrushHelper.Parse(Palette.BackgroundAlt);
+            mb.Padding = new Thickness(6, 0, 6, 0);
+        });
+
         return Grid(
             [GridSize.Star()],
-            [GridSize.Auto, GridSize.Auto, GridSize.Star(), GridSize.Auto],
-            menuBar.Grid(row: 0, column: 0),
-            addressBar.Grid(row: 1, column: 0),
+            [
+                GridSize.Auto, // brand header
+                GridSize.Auto, // accent strip
+                GridSize.Auto, // menu bar
+                GridSize.Auto, // address bar
+                GridSize.Star(), // tree + values
+                GridSize.Auto, // status bar
+            ],
+            BuildHeader().Grid(row: 0, column: 0),
+            BuildAccentStrip().Grid(row: 1, column: 0),
+            menuBarElement.Grid(row: 2, column: 0),
+            addressBar.Grid(row: 3, column: 0),
             Component<SplitPanel, SplitPanelProps>(new SplitPanelProps(
                 Left: tree,
                 Right: VStack(0,
@@ -824,39 +1095,112 @@ class RegeditApp : Component
                     exportDialog,
                     renameKeyDialog,
                     renameValueDialog,
-                    aboutDialog
+                    aboutDialog,
+                    confirmDeleteDialog
                 )
-            )).Grid(row: 2, column: 0),
-            statusBar.Grid(row: 3, column: 0)
+            )).Grid(row: 4, column: 0),
+            statusBar.Grid(row: 5, column: 0)
         )
-        // Spec 033 §6 — Mica window backdrop on a primary tool surface.
-        .Backdrop(BackdropKind.Mica);
+        .Background(Palette.Background)
+        .RequestedTheme(ElementTheme.Dark);
     }
+
+    // ── Shell chrome helpers ─────────────────────────────────────────
+
+    /// <summary>Brand header: three accent dots, the app title, and a chip.</summary>
+    private static Element BuildHeader() =>
+        Grid(
+            [GridSize.Star(), GridSize.Auto],
+            [GridSize.Auto],
+            HStack(12,
+                HStack(4,
+                    DotEl(Palette.Blue),
+                    DotEl(Palette.Purple),
+                    DotEl(Palette.Amber)
+                ).VAlign(VerticalAlignment.Center),
+                VStack(1,
+                    TextBlock("Registry Editor")
+                        .FontSize(15)
+                        .SemiBold()
+                        .Foreground(Palette.TextPrimary),
+                    TextBlock("Microsoft.UI.Reactor  ·  WinUI 3")
+                        .FontSize(10)
+                        .Foreground(Palette.TextMuted)
+                )
+            ).Grid(row: 0, column: 0).VAlign(VerticalAlignment.Center),
+            ChipEl(Strings.ReactorBadge, Palette.Purple)
+                .Grid(row: 0, column: 1)
+                .VAlign(VerticalAlignment.Center)
+        )
+        .Background(Palette.BackgroundAlt)
+        .Padding(16, 10, 16, 10);
+
+    /// <summary>Thin blue → purple → pink → amber gradient rule under the header.</summary>
+    private static Element BuildAccentStrip()
+    {
+        var brush = new LinearGradientBrush
+        {
+            StartPoint = new Windows.Foundation.Point(0, 0.5),
+            EndPoint = new Windows.Foundation.Point(1, 0.5),
+        };
+
+        foreach (var (offset, color) in new[]
+        {
+            (0.00, Palette.Blue),
+            (0.35, Palette.Purple),
+            (0.70, Palette.Pink),
+            (1.00, Palette.Amber),
+        })
+        {
+            brush.GradientStops.Add(new GradientStop
+            {
+                Offset = offset,
+                Color = BrushHelper.Parse(color).Color,
+            });
+        }
+
+        return Border(Empty())
+            .Height(2)
+            .Background(brush)
+            .HAlign(HorizontalAlignment.Stretch);
+    }
+
+    private static Element DotEl(string color) =>
+        Border(Empty())
+            .Width(6)
+            .Height(6)
+            .CornerRadius(3)
+            .Background(color)
+            .VAlign(VerticalAlignment.Center);
+
+    private static Element ChipEl(string text, string color) =>
+        Border(
+            TextBlock(text)
+                .FontSize(10)
+                .SemiBold()
+                .Foreground(color)
+                .Set(tb => tb.CharacterSpacing = 140)
+        )
+        .Background(Palette.Tint(color, 0x22))
+        .BorderBrush(Palette.Tint(color, 0x66))
+        .BorderThickness(1)
+        .CornerRadius(4)
+        .Padding(10, 3, 10, 3);
 
     /// <summary>
     /// Builds the dynamic Favorites menu items (Add/Remove + saved favorites).
     /// </summary>
     private static MenuFlyoutItemBase[] BuildFavoritesMenu(
         Dictionary<string, string> favorites,
-        string favoriteName,
         string currentKeyPath,
-        Action<string> setFavoriteName,
+        Action<string> startAddFavorite,
         Action<ActiveDialog> setActiveDialog,
         Action<int> setSelectedFavoriteIndex,
         Action<string> navigateToKey)
     {
         var items = new List<MenuFlyoutItemBase>
         {
-            MenuItem(Strings.AddToFavorites, () =>
-            {
-                // Default favorite name to last segment of current key path
-                var name = string.IsNullOrEmpty(currentKeyPath) ? ""
-                    : currentKeyPath.Contains('\\')
-                        ? currentKeyPath[(currentKeyPath.LastIndexOf('\\') + 1)..]
-                        : currentKeyPath;
-                setFavoriteName(name);
-                setActiveDialog(ActiveDialog.AddFavorite);
-            }),
+            MenuItem(Strings.AddToFavorites, () => startAddFavorite(currentKeyPath)),
             MenuItem(Strings.RemoveFromFavorites, () =>
             {
                 setSelectedFavoriteIndex(-1);

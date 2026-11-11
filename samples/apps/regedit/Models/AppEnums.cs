@@ -52,3 +52,29 @@ public enum NewValueKind
     MultiStringValue,
     ExpandableStringValue,
 }
+
+/// <summary>
+/// Actions offered by the key/node context menu. The tree surfaces these and
+/// the root component routes them to the existing command handlers.
+/// </summary>
+public enum KeyAction
+{
+    Open,
+    NewKey,
+    NewStringValue,
+    NewBinaryValue,
+    NewDwordValue,
+    NewQwordValue,
+    NewMultiStringValue,
+    NewExpandStringValue,
+    Rename,
+    Delete,
+    CopyKeyName,
+    Export,
+    Refresh,
+    Find,
+    AddFavorite,
+}
+
+/// <summary>Pending destructive action awaiting confirmation.</summary>
+public sealed record DeleteRequest(string KeyPath, string ValueName, string Label, bool IsKey);

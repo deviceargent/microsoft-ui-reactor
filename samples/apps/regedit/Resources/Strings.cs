@@ -17,6 +17,16 @@ internal static class Strings
     public const string ModifyBinaryData = "Modify Binary Data...";
     public const string Delete = "Delete";
     public const string Rename = "Rename";
+    public const string Open = "Open";
+    public const string CopyName = "Copy Name";
+    public const string CopyData = "Copy Data";
+
+    // Shell chrome
+    public const string CurrentKey = "CURRENT KEY";
+    public const string Hives = "HIVES";
+    public const string ValuesSuffix = "values";
+    public const string ContextHint = "Right-click for actions";
+    public const string ReactorBadge = "REACTOR";
 
     // Menu bar - File
     public const string FileMenu = "File";
